@@ -382,6 +382,7 @@ describe('compiler', () => {
     // The `root` className string should be a composition of multiple classes:
     expect(outputA.source).toMatchInlineSnapshot(`
       import '{{__dirname}}/fixtures/unused-compositions/shared.css.ts.vanilla.css';
+      import '{{__dirname}}/fixtures/unused-compositions/styles_a.css.ts.vanilla.css';
       export var root = 'styles_a_root__mh4uy80 shared_shared__5i7sy00';
     `);
 
@@ -392,6 +393,7 @@ describe('compiler', () => {
     // The `root` className string should be a composition of multiple classes:
     expect(outputB.source).toMatchInlineSnapshot(`
       import '{{__dirname}}/fixtures/unused-compositions/shared.css.ts.vanilla.css';
+      import '{{__dirname}}/fixtures/unused-compositions/styles_b.css.ts.vanilla.css';
       export var root = 'styles_b_root__1k6843p0 shared_shared__5i7sy00';
     `);
 

@@ -2,7 +2,14 @@ import assert from 'assert';
 import { join, isAbsolute } from 'path';
 import type { Adapter } from '@vanilla-extract/css';
 import { transformCss } from '@vanilla-extract/css/transformCss';
-import type { ModuleNode, UserConfig as ViteUserConfig } from 'vite';
+import {
+  type ModuleNode,
+  type UserConfig as ViteUserConfig,
+  type ViteDevServer,
+  createServer,
+  createServerModuleRunner,
+} from 'vite';
+import { type ModuleRunner, EvaluatedModules } from 'vite/module-runner';
 
 import {
   cssFileFilter,
@@ -89,6 +96,11 @@ const createModuleScanner = () => {
   return scanModule;
 };
 
+type Context = {
+  server: ViteDevServer;
+  runner: ModuleRunner;
+};
+
 const createViteServer = async ({
   root,
   identifiers,
@@ -97,11 +109,10 @@ const createViteServer = async ({
 }: Required<
   Pick<CreateCompilerOptions, 'root' | 'identifiers' | 'viteConfig'>
 > &
-  Pick<CreateCompilerOptions, 'enableFileWatcher'>) => {
+  Pick<CreateCompilerOptions, 'enableFileWatcher'>): Promise<Context> => {
   const pkg = getPackageInfo(root);
-  const vite = await import('vite');
 
-  const server = await vite.createServer({
+  const server = await createServer({
     ...viteConfig,
     // The vite-node server should not rewrite imported asset URLs within VE stylesheets.
     // Doing so interferes with Vite's resolution and bundling of these assets at build time.
@@ -111,6 +122,7 @@ const createViteServer = async ({
     // Don't include HTML middlewares
     appType: 'custom',
     server: {
+      preTransformRequests: false,
       middlewareMode: viteConfig.server?.middlewareMode,
       hmr: false,
       watch: enableFileWatcher ? viteConfig.server?.watch : null,
@@ -129,7 +141,12 @@ const createViteServer = async ({
       assetsInlineLimit: viteConfig.build?.assetsInlineLimit,
     },
     ssr: {
-      noExternal: true,
+      // `createServerModuleRunner` evaluates modules as ESM (`AsyncFunction`). Forcing every
+      // dependency through the SSR transform (`noExternal: true`) executes arbitrary CJS in that
+      // context (`module is not defined`). Externalize `node_modules` by default and only pull
+      // Vanilla Extract packages through Vite.
+      external: true,
+      noExternal: [/^@vanilla-extract\//, /^@emotion\//],
     },
     plugins: [
       {
@@ -169,36 +186,18 @@ const createViteServer = async ({
   // this is need to initialize the plugins
   await server.pluginContainer.buildStart({});
 
-  const { ViteNodeRunner } = await import('vite-node/client');
-  const { ViteNodeServer } = await import('vite-node/server');
-
-  const node = new ViteNodeServer(server);
-
-  class ViteNodeRunnerWithContext extends ViteNodeRunner {
-    cssAdapter: Adapter | undefined;
-
-    prepareContext(context: Record<string, any>): Record<string, any> {
-      return {
-        ...super.prepareContext(context),
-        [globalAdapterIdentifier]: this.cssAdapter,
-      };
-    }
-  }
-
-  const runner = new ViteNodeRunnerWithContext({
-    root,
-    base: server.config.base,
-    fetchModule(id) {
-      return node.fetchModule(id);
-    },
-    resolveId(id, importer) {
-      return node.resolveId(id, importer);
-    },
+  const ssr = server.environments.ssr;
+  const runner = createServerModuleRunner(ssr, {
+    hmr: false,
+    sourcemapInterceptor: false,
   });
 
   if (enableFileWatcher) {
     server.watcher.on('change', (filePath) => {
-      runner.moduleCache.invalidateDepTree([filePath]);
+      const mod = runner.evaluatedModules.getModuleById(filePath);
+      if (mod) {
+        runner.evaluatedModules.invalidateModule(mod);
+      }
     });
   }
 
@@ -407,12 +406,20 @@ export const createCompiler = ({
 
       const { fileExports, cssImports, watchFiles, lastInvalidationTimestamp } =
         await lock(async () => {
-          runner.cssAdapter = cssAdapter;
+          const cache = new EvaluatedModules();
+          runner.evaluatedModules = cache;
 
-          const fileExports = (await runner.executeFile(filePath)) as Record<
-            string,
-            unknown
-          >;
+          const globalForAdapter = globalThis as typeof globalThis &
+            Record<typeof globalAdapterIdentifier, Adapter | undefined>;
+          globalForAdapter[globalAdapterIdentifier] = cssAdapter;
+
+          let fileExports: Record<string, unknown>;
+          try {
+            fileExports =
+              await runner.import<Record<string, unknown>>(filePath);
+          } finally {
+            delete globalForAdapter[globalAdapterIdentifier];
+          }
 
           const moduleId = normalizePath(filePath);
           const moduleNode = server.moduleGraph.getModuleById(moduleId);
@@ -517,9 +524,13 @@ export const createCompiler = ({
     async unstable_invalidateAllModules() {
       const { server, runner } = await vitePromise;
 
-      for (const [key] of runner.moduleCache.entries()) {
-        if (!key.includes('node_modules')) {
-          runner.moduleCache.delete(key);
+      const evaluatedIds = runner.evaluatedModules.idToModuleMap.keys();
+      for (const id of evaluatedIds) {
+        if (!id.includes('node_modules')) {
+          const mod = runner.evaluatedModules.getModuleById(id);
+          if (mod) {
+            runner.evaluatedModules.invalidateModule(mod);
+          }
         }
       }
 
@@ -545,9 +556,13 @@ export const createCompiler = ({
       };
     },
     async close() {
-      const { server } = await vitePromise;
+      const { server, runner } = await vitePromise;
 
-      await server.close();
+      try {
+        await runner.close();
+      } finally {
+        await server.close();
+      }
     },
     getAllCss() {
       let allCss = '';
